@@ -1,0 +1,121 @@
+{
+  "name": "pl_bronze_orders_ingest",
+  "properties": {
+    "description": "Watermark-based incremental ingestion for the orders entity into Bronze Delta.",
+    "parameters": {
+      "p_entity": {
+        "type": "String",
+        "defaultValue": "orders"
+      },
+      "p_landing_path": {
+        "type": "String",
+        "defaultValue": "Files/landing/orders"
+      }
+    },
+    "activities": [
+      {
+        "name": "LookupWatermark",
+        "type": "Lookup",
+        "description": "Read the last successful watermark for this entity.",
+        "typeProperties": {
+          "source": {
+            "type": "LakehouseTableSource",
+            "query": "SELECT COALESCE(MAX(last_value), CAST('1900-01-01T00:00:00' AS TIMESTAMP)) AS last_watermark FROM bronze.pipeline_watermark WHERE entity_name = '@{pipeline().parameters.p_entity}'"
+          },
+          "firstRowOnly": true
+        }
+      },
+      {
+        "name": "CopyIncrementalOrders",
+        "type": "Copy",
+        "description": "Download rows where updated_at > last watermark from the source REST API.",
+        "dependsOn": [
+          { "activity": "LookupWatermark", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": {
+          "source": {
+            "type": "RestSource",
+            "httpRequestTimeout": "00:02:00",
+            "additionalHeaders": {
+              "Accept": "text/csv"
+            },
+            "relativeUrl": "@concat('/orders?since=', activity('LookupWatermark').output.firstRow.last_watermark)"
+          },
+          "sink": {
+            "type": "LakehouseTableSink",
+            "rootFolderPath": "@pipeline().parameters.p_landing_path",
+            "fileName": "@concat(formatDateTime(utcNow(),'yyyyMMddHHmmss'), '_orders.csv')"
+          },
+          "enableStaging": false
+        }
+      },
+      {
+        "name": "NotebookBronzeLoad",
+        "type": "TridentNotebook",
+        "description": "Append landing CSV to bronze.orders_raw Delta table.",
+        "dependsOn": [
+          { "activity": "CopyIncrementalOrders", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": {
+          "notebookId": "01_bronze_orders_load",
+          "parameters": {
+            "p_landing_path": {
+              "value": "@pipeline().parameters.p_landing_path",
+              "type": "string"
+            },
+            "p_ingest_date": {
+              "value": "@formatDateTime(utcNow(), 'yyyy-MM-dd')",
+              "type": "string"
+            }
+          },
+          "sessionProperties": {
+            "executorCores": 4,
+            "executorMemory": "28g",
+            "driverCores": 4,
+            "driverMemory": "28g",
+            "numExecutors": 2
+          }
+        }
+      },
+      {
+        "name": "UpdateWatermark",
+        "type": "Script",
+        "description": "Atomically update the watermark to the max updated_at from this batch.",
+        "dependsOn": [
+          { "activity": "NotebookBronzeLoad", "dependencyConditions": ["Succeeded"] }
+        ],
+        "typeProperties": {
+          "scripts": [
+            {
+              "type": "Query",
+              "text": "MERGE INTO bronze.pipeline_watermark AS t USING (SELECT '@{pipeline().parameters.p_entity}' AS entity_name, 'updated_at' AS watermark_col, MAX(updated_at) AS last_value, CURRENT_TIMESTAMP() AS updated_at FROM bronze.orders_raw WHERE _ingest_date = '@{formatDateTime(utcNow(), 'yyyy-MM-dd')}') AS s ON t.entity_name = s.entity_name WHEN MATCHED THEN UPDATE SET t.last_value = s.last_value, t.updated_at = s.updated_at WHEN NOT MATCHED THEN INSERT (pipeline_name, entity_name, watermark_col, last_value, updated_at) VALUES ('pl_bronze_orders_ingest', s.entity_name, s.watermark_col, s.last_value, s.updated_at)"
+            }
+          ]
+        }
+      },
+      {
+        "name": "OnFailureAlert",
+        "type": "TridentNotebook",
+        "description": "Log failure to pipeline_errors table and emit alert.",
+        "dependsOn": [
+          { "activity": "CopyIncrementalOrders", "dependencyConditions": ["Failed"] },
+          { "activity": "NotebookBronzeLoad", "dependencyConditions": ["Failed"] },
+          { "activity": "UpdateWatermark", "dependencyConditions": ["Failed"] }
+        ],
+        "typeProperties": {
+          "notebookId": "08_log_pipeline_error",
+          "parameters": {
+            "p_pipeline_name": {
+              "value": "@pipeline().Pipeline",
+              "type": "string"
+            },
+            "p_error_message": {
+              "value": "@activity('NotebookBronzeLoad').error.message",
+              "type": "string"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
